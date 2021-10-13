@@ -1,0 +1,21 @@
+#  ADgroup configuration file
+#
+
+[Admin]
+# AD group that has authorization to create AD storage groups. Users must me in this group
+# to create, modify primary storage groups.
+admingroup = ldapadminsudo
+
+[AD]
+adserver = ldap://dc.yourdomain.com
+adsearchbase = dc=yourdomain,dc=com
+
+[OU]
+# OU used for create of new storage group
+createou = OU=Storage Management,OU=Security Groups,OU=Groups,OU=example,DC=yourdomain,DC=com
+
+[Attrs]
+# Atributes for Queries 
+empolyee = ["displayName", "manager", "title", "description",
+            "department", "division", "mail", "physicalDeliveryOfficeName", "uid"]
+group = ["distinguishedName"]
