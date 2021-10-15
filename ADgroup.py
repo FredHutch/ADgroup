@@ -13,6 +13,7 @@ Dirk Petersen dipeit@gmail.com 2013
 """
 
 import sys
+import os
 import re
 import getpass
 import ldap
@@ -24,10 +25,9 @@ import logging
 import struct
 import configparser
 import json
-import base64
 
-__version__ = '1.0.0'
-__date__ = 'Oct 1, 2021'
+__version__ = '1.0.1'
+__date__ = 'Oct 15, 2021'
 __maintainer__ = 'John Dey jfdey@fredhutch.org'
 
 logging.basicConfig(
@@ -55,8 +55,11 @@ class ldapOps:
     def read_config(self):
         """read INI style configuration file"""
         config = configparser.ConfigParser()
+        file_path = os.path.dirname(os.path.realpath(__file__))
+        config_path = os.path.join(file_path, 'ADgroup.ini')
+        logging.debug('ini path: {}'.format(config_path))
         try:
-            config.read("ADgroup.ini")
+            config.read(config_path)
         except configparser.Error:
             print('could not read ini')
             raise SystemExit
@@ -95,6 +98,7 @@ class ldapOps:
             elif "desc" in err:
                 print("LDAP error: {}".format(desc)["desc"])
             raise SystemExit
+        logging.debug('SASL Authorization Identity: {}'.format(lcon.whoami_s()))
         return lcon
 
     def groupChangeMembers(self, groupname, samlist=[], changemode="add"):
@@ -124,7 +128,7 @@ class ldapOps:
             try:
                 self.lcon.modify_s(groupdn, change_member)
                 changed.append(result[0])
-            except ldap.ALREADY_EXISTS as exists_err:
+            except ldap.ALREADY_EXISTS:
                 print("Error: User {}, already Exists in group: {}.".format(samlist, groupname))
                 return
             except ldap.LDAPError as err:
@@ -151,6 +155,9 @@ class ldapOps:
         errstr = ""
         try:
             self.lcon.add_s(grp_dn, grp_ldif)
+        except ldap.ALREADY_EXISTS:
+            print(("Group Already Exists: {}".format(grp_dn)))
+            raise SystemExit
         except ldap.LDAPError as err:
             if "desc" in err[0]:
                 errstr = err[0]["desc"]
@@ -171,6 +178,10 @@ class ldapOps:
         else:
             print('GID not set')
             return False
+
+    def groupDelete(self, samname):
+        """Delete group, """
+        pass
 
     def gidNumberSet(self, DN):
         """ return the GID after groupCreate
@@ -310,7 +321,6 @@ class ldapOps:
                 continue
             if full:
                 for f in result[1]:
-
                     self.printkv(f, result[1][f])
             else:
                 for f in self.EmpolyeeAttrs:
@@ -330,12 +340,11 @@ class ldapOps:
                 data = item.decode("utf-8")
             except UnicodeDecodeError:
                 data = item
-            if k in ["display", "distinguishedName"]:
-                print(" -- {}: ".format(k), end="")
-            else:
-                print("    {}: ".format(k), end="")
-            print("{} ".format(data), end="")
-        print("")
+            if k == 'displayName':
+                (last, first) = data.split(',')
+                fixed = first.strip() + ' ' + last
+                print("    {}: {}".format('DisplayName', fixed))
+            print("    {}: {}".format(k, data))
 
     def getAttr(self, dn, attrs):
         """search on DN for a list attrs.
@@ -368,7 +377,7 @@ class ldapOps:
                     except UnicodeDecodeError:
                         query_value = namesearch[0][1][attr][0]
                     result.append([attr, query_value])
-        if len(result) is 0:
+        if len(result) == 0:
             return None
         else:
             return result
@@ -412,7 +421,9 @@ class ldapOps:
             if results is None:
                 break
             dresult = dict(results)
-            print('{} - {} ({})'.format(dresult['displayName'], dresult['title'],
+            (last, first) = dresult['displayName'].split(',')
+            fixed = first.strip() + ' ' + last
+            print('{} - {} ({})'.format(fixed, dresult['title'],
                                         dresult['sAMAccountName']))
             if 'manager' in dresult:
                 managerDN = self.escapeDN(dresult['manager'])
@@ -499,18 +510,14 @@ def main():
     if args.create:
         if not args.groupname.endswith("_grp"):
             args.groupname = args.groupname + "_grp"
-        gid = ad.groupCreate(args.groupname)
+        ad.groupCreate(args.groupname)
         print(repmsg)
     elif args.members2add:
         args.members2add = args.members2add.replace(" ", ",")
-        added = ad.groupChangeMembers(
-            args.groupname, args.members2add.split(","), changemode="add"
-        )
+        ad.groupChangeMembers(args.groupname, args.members2add.split(","), changemode="add")
     elif args.members2remove:
         args.members2remove = args.members2remove.replace(" ", ",")
-        removed = ad.groupChangeMembers(
-            args.groupname, args.members2remove.split(","), changemode="remov"
-        )
+        ad.groupChangeMembers(args.groupname, args.members2remove.split(","), changemode="remov")
     elif args.user:
         ad.user_info(args.groupname, args.full)
     elif args.group:
