@@ -439,6 +439,7 @@ def parse_arguments():
         "and use Kerberos tickets to authorize group managers"
     )
     parser = argparse.ArgumentParser(prog="ADgroup", description=help)
+    parser.add_argument('--version', '-V', action='version', version="%(prog)s " + __version__)
     parser.add_argument(
         "--debug", "-d", dest="debug", action="store_true", default=False,
         help="Enable debug messages",
