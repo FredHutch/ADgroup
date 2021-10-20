@@ -26,8 +26,8 @@ import struct
 import configparser
 import json
 
-__version__ = '1.0.1'
-__date__ = 'Oct 15, 2021'
+__version__ = '1.0.2'
+__date__ = 'Oct 20, 2021'
 __maintainer__ = 'John Dey jfdey@fredhutch.org'
 
 logging.basicConfig(
@@ -149,7 +149,8 @@ class ldapOps:
         grp_attrs["objectClass"] = [bytes("top", "utf8"), bytes("group", "utf8")]
         grp_attrs["cn"] = bytes(samname, "utf8")
         grp_attrs["sAMAccountName"] = bytes(samname, "utf8")
-        grp_attrs["description"] = bytes("(created by {} with ADgroup)".format(self.curruser), "utf8")
+        grp_attrs["description"] = bytes("(created by {} with ADgroup)".
+                                         format(self.curruser), "utf8")
         grp_ldif = ldap.modlist.addModlist(grp_attrs)
         # Add the new group account
         errstr = ""
@@ -244,7 +245,8 @@ class ldapOps:
                 errstr = err[0]["desc"]
             if "info" in err[0]:
                 errstr += err[0]["info"]
-            print(("Error setting Group Attr: object: [{}] Attr: [{}] err: {}".format(samOrDn, attr, errstr)))
+            print("Error setting Group Attr: object: [{}] Attr: [{}] err: {}".format(
+                  samOrDn, attr, errstr))
             return False
         return True
 
@@ -384,7 +386,8 @@ class ldapOps:
 
     def convertSid(self, sid_obj):
         """  convert base64 encoded objectSid to string representation """
-        if hasattr(sid_obj, "__iter__"):
+        logging.debug('type: {}'.format(type(sid_obj)))
+        if isinstance(sid_obj, list):
             sid = sid_obj[0]
         else:
             sid = sid_obj
@@ -439,7 +442,9 @@ def parse_arguments():
         "and use Kerberos tickets to authorize group managers"
     )
     parser = argparse.ArgumentParser(prog="ADgroup", description=help)
-    parser.add_argument('--version', '-V', action='version', version="%(prog)s " + __version__)
+    parser.add_argument(
+        '--version', '-V', action='version', version="%(prog)s " + __version__ + ' - ' + __date__
+    )
     parser.add_argument(
         "--debug", "-d", dest="debug", action="store_true", default=False,
         help="Enable debug messages",

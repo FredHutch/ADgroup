@@ -2,12 +2,15 @@
 
 Please update this file when making changes to ADgroup.py
 
+## [1.0.2] Oct 20, 2021
+  * bug gidNumber not set during create group.  Issues with decoding objectSid
+
 ## [1.0.1] Oct 15, 2021
-bugs: Path to ADgroup.ini was relative and only worked from the project folder.
-
-reformat to pass flake8
-
-AD displayName outputs last, first.  Create new field: DisplayName, with First Last
+ 
+  * bug fix: Path to ADgroup.ini was relative and only worked from the project folder.
+  * reformat to pass flake8
+  * AD displayName outputs last, first.  Create new field: DisplayName, with First Last
+  * Add --version argument
 
 ## [1.0.0] Oct 1, 2021
 Initial release.  ADgroup is a refactoring of fhgroup.py. 
