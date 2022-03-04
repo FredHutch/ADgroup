@@ -3,7 +3,8 @@
 """
     ADgroup.py manage security groups in Active Directory from kerberized Linux Systems
 
-
+2022.02.08
+2021.10.09 fix bug with DisplayName. Users with more than one comma in their name.
 2021.09.14 John Dey jfdey@fredhutch.org john@fuzzdog.com
            Convert from Python2 to Python3
            ldap3 Attribute values are returned as byte strings must be decoded to utf-8
@@ -14,21 +15,22 @@ Dirk Petersen dipeit@gmail.com 2013
 
 import sys
 import os
-import re
 import getpass
-import ldap
-import ldap.sasl
-import ldap.modlist
-import ldap3
-import argparse
+import ssl
+from ldap3 import Server, Connection, Tls
+from ldap3 import SASL, SUBTREE, KERBEROS
+from ldap3 import MODIFY_ADD, MODIFY_DELETE
+from ldap3.core.exceptions import LDAPException, LDAPEntryAlreadyExistsResult
+from gssapi.raw.misc import GSSError
+from argparse import SUPPRESS, ArgumentParser
 import logging
-import struct
 import configparser
 import json
 
-__version__ = '1.0.2'
-__date__ = 'Oct 20, 2021'
+__version__ = '1.1.0'
+__date__ = 'Feb 15, 2022'
 __maintainer__ = 'John Dey jfdey@fredhutch.org'
+
 
 logging.basicConfig(
     format="%(levelname)s [%(funcName)s:%(lineno)s] %(message)s", level=logging.WARN
@@ -45,210 +47,192 @@ class ldapOps:
         self.lcon = self.ldap_gss_init()
 
         self.curruser = getpass.getuser()
-        if self.curruser in self.groupGetMembers(self.AdminGroup):  # AD.AdminGroup
+        if self.isMemberOf(self.curruser, self.AdminGroup):
             logging.debug("user: {} is member of the Admin group.: {}".format(
                     self.curruser, self.AdminGroup))
         else:
             print("Apparently you are not member of any administrative security groups."
                   " You will not be able to create or change AD groups.")
 
+    def unbind(self):
+        self.lcon.unbind()
+        logging.debug('result: {}'.format(self.lcon.result))
+
+    def abort(self, msg):
+        """
+           End our session and close the communication to the server
+        """
+        print(msg, file=sys.stderr)
+        self.unbind()
+        raise SystemExit
+
     def read_config(self):
         """read INI style configuration file"""
         config = configparser.ConfigParser()
         file_path = os.path.dirname(os.path.realpath(__file__))
         config_path = os.path.join(file_path, 'ADgroup.ini')
-        logging.debug('ini path: {}'.format(config_path))
+        logging.debug('using ini file: {}'.format(config_path))
         try:
             config.read(config_path)
         except configparser.Error:
             print('could not read ini')
             raise SystemExit
         self.AdminGroup = config["Admin"]["admingroup"]
-
         self.ADServer = config["AD"]["adserver"]
         self.ADSearchBase = config["AD"]["adsearchbase"]
-        self.ADSearchScope = ldap.SCOPE_SUBTREE
-
         self.CreateOU = config["OU"]["createou"]
-
         self.EmpolyeeAttrs = json.loads(config.get("Attrs", "empolyee"))
         self.GroupAttrs = json.loads(config.get("Attrs", "group"))
         logging.debug("ADServer: {}".format(self.ADServer))
-        logging.debug("Empolyee Attrs: {}".format(self.EmpolyeeAttrs))
+        logging.debug("CreateOU: {}".format(self.CreateOU))
 
     def ldap_gss_init(self):
+        """ Use SASL Kerberos connection, optional connect methods could be used
+        return_empty_attributes parameter to True
+        """
+        tls = Tls(validate=ssl.CERT_NONE, version=ssl.PROTOCOL_TLSv1_2)
+        server = Server(self.ADServer, use_ssl=True, tls=tls)
         try:
-            lcon = ldap.initialize(self.ADServer, bytes_mode=False)
-            lcon.set_option(ldap.OPT_REFERRALS, 0)
-        except ldap.LDAPError as err:
-            print("Error with ADServer URL: {}".format(err.args[0]))
+            lcon = Connection(server, authentication=SASL, client_strategy='SYNC',
+                              sasl_mechanism=KERBEROS)
+        except LDAPException as err:
+            print("Error LDAP connection. ADServer URL: {}".format(err))
             raise SystemExit
-        auth = ldap.sasl.gssapi("")
         try:
-            lcon.sasl_interactive_bind_s("", auth)
-        except ldap.LDAPError as ldap_err:
-            logging.debug("LDAPError: {}".format(ldap_err))
-            err = dict(ldap_err.args[0])
-            desc = info = None
-            if "info" in err:
-                info = err["info"]
-                print("LDAP Error: {}".format(info))
-                if "expired" in info:
-                    print(" - Use kinit command to get new a Kerberos ticket.")
-            elif "desc" in err:
-                print("LDAP error: {}".format(desc)["desc"])
+            sync = lcon.bind()
+        except GSSError as err:
+            err_msg = str(err)
+            if 'Ticket expired' in err_msg:
+                print('Ticket expired; use kinit to get a new Kerberos ticket')
+            else:
+                print(err_msg)
             raise SystemExit
-        logging.debug('SASL Authorization Identity: {}'.format(lcon.whoami_s()))
+        if not sync:
+            logging.error('bind result: {}'.format(self.lcon.result))
+            raise SystemExit
+        logging.debug('SASL Authorization Identity: {}'.format(lcon.extend.standard.who_am_i()))
         return lcon
 
     def groupChangeMembers(self, groupname, samlist=[], changemode="add"):
+        """ Add or remove members from Storage group """
         groupdn = self.groupGetDN(groupname)
-        changed = []
-        adjective = 'to'
-        if not groupdn:
-            print("Group does not exist")
-            return changed
         ldaplist = ""
         for user in samlist:
             ldaplist += "(sAMAccountName=" + user + ")"
         ldapfilter = ("(&(|(sAMAccountType=805306368)(objectCategory=group))"
                       "(|" + ldaplist + "))")
-        Attrs = []
-        r = self.lcon.search(self.ADSearchBase, self.ADSearchScope, ldapfilter, Attrs)
-        result_type, Results = self.lcon.result(r, 60)
-        for result in Results:
-            if not result[0]:
+        sync = self.lcon.search(search_base=self.ADSearchBase,
+                                search_filter=ldapfilter, search_scope=SUBTREE, attributes=[])
+        if not sync or self.lcon.result['result'] != 0:
+            logging.error('search failed: {}\nfilter: {}'.format(self.lcon.result, ldapfilter))
+            self.abort()
+        for result in self.lcon.response:
+            if 'dn' in result:
+                memberDN = result['dn']
+            else:
                 continue
-            member = ldap3.utils.conv.to_raw(result[0], encoding="utf-8")
             if changemode == "add":
-                change_member = [(ldap.MOD_ADD, "member", member)]
+                change_member = {'member': [(MODIFY_ADD, [memberDN])]}
             elif changemode == "remov":
-                change_member = [(ldap.MOD_DELETE, "member", member)]
-                adjective = 'from'
+                change_member = {'member': [(MODIFY_DELETE, [memberDN])]}
             try:
-                self.lcon.modify_s(groupdn, change_member)
-                changed.append(result[0])
-            except ldap.ALREADY_EXISTS:
-                print("Error: User {}, already Exists in group: {}.".format(samlist, groupname))
+                self.lcon.modify(groupdn, change_member)
+            except LDAPEntryAlreadyExistsResult:
+                logging.error("User {}, already Exists in group: {}.".format(samlist, groupname))
                 return
-            except ldap.LDAPError as err:
+            except LDAPException as err:
                 errstr = err[0]["desc"]
                 print(("Error changing memberhsip of '{}' "
                        "in group: {}".format(result[1]["sAMAccountName"][0], errstr)))
-        if changed:
-            print("successfully {}ed members {} group '{}':\n{}".format(
-                        changemode, adjective, groupname, " \n".join(changed)))
-            return True
-        return False
+            if self.lcon.result['result'] == 0:
+                print('successfully {}ed "{}" to/from group "{}"'.format(
+                        changemode, memberDN, groupname))
 
     def groupCreate(self, samname):
-        """ create group with unique GID based on objectSid
+        """
+           --create
+           create group with unique GID based on objectSid
+           this is a two step process. Create the storage object first then add the gidnumber to
+           the storage group object.
         """
         grp_dn = "CN=" + samname + "," + self.CreateOU
-        grp_attrs = {}
-        grp_attrs["objectClass"] = [bytes("top", "utf8"), bytes("group", "utf8")]
-        grp_attrs["cn"] = bytes(samname, "utf8")
-        grp_attrs["sAMAccountName"] = bytes(samname, "utf8")
-        grp_attrs["description"] = bytes("(created by {} with ADgroup)".
-                                         format(self.curruser), "utf8")
-        grp_ldif = ldap.modlist.addModlist(grp_attrs)
-        # Add the new group account
-        errstr = ""
-        try:
-            self.lcon.add_s(grp_dn, grp_ldif)
-        except ldap.ALREADY_EXISTS:
-            print(("Group Already Exists: {}".format(grp_dn)))
-            raise SystemExit
-        except ldap.LDAPError as err:
-            if "desc" in err[0]:
-                errstr = err[0]["desc"]
-            if "info" in err[0]:
-                errstr += err[0]["info"]
-            print(("Error creating group object '{}': {}".format(grp_dn, errstr)))
-            return False
+        grp_attrs = {
+            'objectClass': ['top', 'group'],
+            'cn': samname,
+            'sAMAccountName': samname,
+            'description': 'created by ' + self.curruser + ' with ADgroup',
+        }
+        sync = self.lcon.add(dn=grp_dn, attributes=grp_attrs)
+        if sync is not True:
+            logging.error("Create group: {}.\nFailed: {}".
+                          format(grp_dn, self.lcon.result['description']))
+            return
+
         # Create and add gidNumber to group object
         gid = self.gidNumberSet(grp_dn)
-        if gid:
-            print(
-                'created group "{}" with gidNumber {} in {}.\n'
-                'Use chgrp {} </my/folder> to apply permissions.'.format(
-                    samname, gid, self.CreateOU, gid
-                )
-            )
-            return True
-        else:
-            print('GID not set')
-            return False
+        print('created group "{}" with gidNumber {}.\nOU: {}.\n'
+              'Use chgrp {} </my/folder> to apply permissions.'.format(
+                    samname, gid, self.CreateOU, gid)
+              )
+        print("Make sure you add at least one member to the new group.\n"
+              "After that you may have to wait up to 15 min until users can access")
 
-    def groupDelete(self, samname):
-        """Delete group, """
-        pass
+    def groupDelete(self, group):
+        """
+           --delete  Delete group
+        """
+        dn = self.groupGetDN(group)
+        sync = self.lcon.delete(dn)
+        if not sync:
+            logging.error("Delete group: {} failed\n{}".format(group, self.lcon.result))
+        else:
+            print("Delete Group success for: {}\n{}".format(group, self.lcon.result))
 
     def gidNumberSet(self, DN):
         """ return the GID after groupCreate
-            rewritten for Python3
-            Create a consistent gidNumber based on ObjectSID
+            Create a consistent gidNumber based on ObjectSID of the group
+            add 1,000,000 to the last six digits of the ObjectSID
         """
-        result = self.getAttr(DN, ["objectSid"])
-        str_sid = self.convertSid(result[0][1])
-        gidNumber = str(self.sidstr2gid(str_sid))
-        ret = self.setGroupAttr(DN, "gidNumber", gidNumber)
-        if ret is False:
-            return ret
-        else:
-            return gidNumber
+        sync = self.getAttr(DN, ["objectSid"])
+        objectSid = str(self.lcon.entries[0].objectSid)
+        logging.debug('objectSid of new group: {}'.format(objectSid))
+        tail = objectSid.split('-')[-1]
+        GID = str(int(tail) + 1000000)
+        add_member = {'gidNumber': [(MODIFY_ADD, [GID])]}
+        sync = self.lcon.modify(DN, add_member)
+        if sync is not True:
+            logging.error("Add attribute to group: {}.".format(DN))
+            logging.error("Failed - error: {}".format(self.lcon.result['description']))
+            return False
+        return GID
 
-    def groupGetMembers(self, samname):
-        """ return list of members from sAMAccountName, <samname>
-            when sAMAccountName is a group
+    def groupGetMembers(self, target, full):
         """
-        members = []
-        dn = self.groupGetDN(samname)
+           --list of members from class "group"
+        """
+        dn = self.groupGetDN(target)
         ldapfilter = "(&(memberof={}))".format(dn)
-        Attrs = ["sAMAccountName"]
-        r = self.lcon.search(self.ADSearchBase, self.ADSearchScope, ldapfilter, Attrs)
-        result_type, Results = self.lcon.result(r, 60)
-        for result in Results:
-            if Attrs[0] in result[1]:
-                members.append(result[1]["sAMAccountName"][0].decode("utf-8"))
-        return members
-
-    def modGroupAttr(self, samOrDn, attr, value):
-        if not samOrDn.lower().startswith("cn="):
-            samOrDn = self.groupGetDN(samOrDn)
-        # grp_attrs = {}
-        # grp_attrs[attr] = [bytes(value, "utf8")]
-        # grp_ldif = ldap.modlist.addModlist(grp_attrs)
-        myattr = [(ldap.MOD_REPLACE, attr, [bytes(value, "utf8")])]
-        try:
-            self.lcon.modify_s(samOrDn, myattr)
-        except ldap.LDAPError as err:
-            errstr = ''
-            if "desc" in err[0]:
-                errstr = err[0]["desc"]
-            if "info" in err[0]:
-                errstr += err[0]["info"]
-            print(("Error setting Group Attr: object: [{}] Attr: [{}] err: {}".format(
-                   samOrDn, attr, errstr)))
-            return False
-        return True
-
-    def setGroupAttr(self, samOrDn, attr, value):
-        if not samOrDn.lower().startswith("cn="):
-            samOrDn = self.groupGetDN(samOrDn)
-        myattr = [(ldap.MOD_ADD, attr, [bytes(value, "utf8")])]
-        try:
-            self.lcon.modify_s(samOrDn, myattr)
-        except ldap.LDAPError as err:
-            errstr = ''
-            if "desc" in err[0]:
-                errstr = err[0]["desc"]
-            if "info" in err[0]:
-                errstr += err[0]["info"]
-            print("Error setting Group Attr: object: [{}] Attr: [{}] err: {}".format(
-                  samOrDn, attr, errstr))
-            return False
-        return True
+        if full:
+            Attrs = ['*']
+        else:
+            Attrs = ["name", "sAMAccountName"]
+        sync = self.lcon.search(search_base=self.ADSearchBase,
+                                search_filter=ldapfilter,
+                                search_scope=SUBTREE,
+                                attributes=Attrs)
+        if not sync or self.lcon.result['result'] != 0:
+            self.abort('search error DN: {}'.format(dn))
+        for result in self.lcon.entries:
+            name = str(result['sAMAccountName'])
+            if full:
+                mail = displayName = ''
+                if 'mail' in result:
+                    mail = str(result.mail)
+                if 'displayName' in result:
+                    displayName = result.displayName
+                print('{:25}{:40}{}'.format(name, mail, displayName))
+            else:
+                print(name)
 
     def groupGetDN(self, samname):
         """ return DN for group
@@ -256,174 +240,137 @@ class ldapOps:
         """
         ldapfilter = "(&(objectCategory=group)(sAMAccountName=%s))" % samname
         Attrs = ["distinguishedName"]
-        r = self.lcon.search(self.ADSearchBase, self.ADSearchScope, ldapfilter, Attrs)
-        result_type, Results = self.lcon.result(r, 60)
-        logging.debug("results: {}".format(Results[0][0]))
-        return Results[0][0]
+        sync = self.lcon.search(search_base=self.ADSearchBase,
+                                search_filter=ldapfilter,
+                                search_scope=SUBTREE,
+                                attributes=Attrs)
+        if not sync:
+            self.abort("search results: {}".format(self.lcon.result))
+        logging.debug("results: {}".format(self.lcon.response))
+        if len(self.lcon.response) == 2:
+            return self.lcon.response[0]['dn']
+        else:
+            print('group not found: {}'.format(samname))
+            self.unbind()
+            raise SystemExit
 
-    def escapeDN(self, DN):
+    def userGetDN(self, samname):
+        """Return DN as usable form for query, ie. Escape valid LDAP filter characters."""
+        ldapfilter = "(&(objectClass=person)(sAMAccountName=%s))" % samname
+        Attrs = ['sAMAccountName']
+        sync = self.lcon.search(search_base=self.ADSearchBase,
+                                search_filter=ldapfilter,
+                                search_scope=SUBTREE,
+                                attributes=Attrs)
+        if not sync or self.lcon.result['result'] != 0:
+            logging.error("search result: {}".format(self.lcon.result))
+            raise SystemExit
+        logging.debug("entries: {}".format(self.lcon.entries))
+        return self.lcon.response[0]['dn']
+
+    def escapeDN(self, dn):
         """The LDAP filter specification assigns special meaning to the following characters:
          * ( ) backslach NUL that should be escaped with a backslash followed by the two character
          ASCII hexadecimal representation of the character when used in a search filter (rfc2254)
         """
+        DN = str(dn)
         DN = DN.replace('\\', '\\5c')
         DN = DN.replace('(', '\\28')
         DN = DN.replace(')', '\\29')
         DN = DN.replace('*', '\\2A')
         return DN
 
-    def userGetDN(self, samname):
-        """Return DN as usable form for query, ie. Escape valid LDAP filter characters."""
-        ldapfilter = "(&(objectClass=person)(sAMAccountName=%s))" % samname
-        Attrs = ['sAMAccountName']
-        r = self.lcon.search(self.ADSearchBase, self.ADSearchScope, ldapfilter, Attrs)
-        result_type, Results = self.lcon.result(r, 60)
-        DN = self.escapeDN(Results[0][0])
-        logging.debug('result: {}'.format(DN))
-        return DN
-
-    def group_info(self, gid, full):
-        """show full AD record for a group
-        search
+    def groupGetEntry(self, gid, full):
+        """
+            --group
+            show full AD record for a group
         """
         if gid.isnumeric():
-            filter = '(&(objectCategory=group)(gidNumber={}))'.format(gid)
+            ldapfilter = '(&(objectCategory=group)(gidNumber={}))'.format(gid)
         else:
-            filter = '(&(objectCategory=group)(sAMAccountName={}))'.format(gid)
-        Attrs = ["*"]
-        r = self.lcon.search(self.ADSearchBase, self.ADSearchScope, filter, Attrs)
-        result_type, Results = self.lcon.result(r, 60)
-        logging.debug('results: {}'.format(Results[0][0]))
-        for result in Results:
-            if not result[0]:
-                break
-            if full:
-                for f in result[1]:
-                    self.printkv(f, result[1][f])
-            else:
-                for f in self.GroupAttrs:
-                    if f not in result[1]:
-                        continue
-                    self.printkv(f, result[1][f])
+            ldapfilter = '(&(objectCategory=group)(cn={}))'.format(gid)
+        if full:
+            Attrs = ["*"]
+        else:
+            Attrs = self.GroupAttrs
+        sync = self.lcon.search(search_base=self.ADSearchBase,
+                                search_filter=ldapfilter,
+                                search_scope=SUBTREE,
+                                attributes=Attrs)
+        if not sync:
+            logging.error("result: {}".format(self.lcon.result))
+            return
+        self.printResponse()
 
-    def user_info(self, uid, full):
-        """query AD by UID"""
+    def userGetEntry(self, uid, full):
+        """
+           --user  uidNumber or name
+        """
         if uid.isnumeric():
-            filter = '(uidNumber={})'.format(uid)
+            ldapfilter = '(uidNumber={})'.format(uid)
         else:
-            filter = "(uid={})".format(uid)
-        Attrs = self.EmpolyeeAttrs
-        Attrs = ["*"]
-        r = self.lcon.search(self.ADSearchBase, self.ADSearchScope, filter, Attrs)
-        # print('Results: {}'.format(r))
-        # print('[]'.format(lcon.entries))
-        result_type, Results = self.lcon.result(r, 60)
-        for result in Results:
-            if not result[0]:
-                continue
-            if full:
-                for f in result[1]:
-                    self.printkv(f, result[1][f])
-            else:
-                for f in self.EmpolyeeAttrs:
-                    if f not in result[1]:
-                        continue
-                    self.printkv(f, result[1][f])
+            ldapfilter = "(&(objectClass=person)(uid={}))".format(uid)
+        if full:
+            Attrs = ["*"]
+        else:
+            Attrs = self.EmpolyeeAttrs
+        sync = self.lcon.search(search_base=self.ADSearchBase,
+                                search_filter=ldapfilter,
+                                search_scope=SUBTREE,
+                                attributes=Attrs)
+        if not sync or self.lcon.result['result'] != 0:
+            logging.error("result: {}".format(self.lcon.result))
+            return
+        self.printResponse()
 
-    def printkv(self, k, v):
-        """Print Key Value record"""
-        for item in v:
-            if k in ['objectSid', 'XobjectGUID']:
-                objectSid = self.convertSid(v)
-                print("    {}: decode({})".format(k, objectSid))
-                gidNumber = self.sidstr2gid(objectSid)
-                print("    {}: decode({})".format('GID', gidNumber))
-            try:
-                data = item.decode("utf-8")
-            except UnicodeDecodeError:
-                data = item
-            if k == 'displayName':
-                (last, first) = data.split(',')
-                fixed = first.strip() + ' ' + last
-                print("    {}: {}".format('DisplayName', fixed))
-            print("    {}: {}".format(k, data))
+    def printResponse(self):
+        """ print response from ldap3 search """
+        if len(self.lcon.entries) == 0:
+            print('no search results')
+            return
+        for obj in self.lcon.response:
+            if 'attributes' not in obj:
+                continue
+            for k, v in obj['attributes'].items():
+                if type(v) is list and len(v) > 0:
+                    print('{:>30}: {}'.format(k, v[0]))
+                    for values in v[1:]:
+                        print('{:32}{}'.format(' ', values))
+                else:
+                    print('{:>30}: {}'.format(k, v))
 
     def getAttr(self, dn, attrs):
-        """search on DN for a list attrs.
-        <dn> type str
-        <attrs> list of str
-        Return array of attrs values converted to type str.
+        """ search by DN for <attrs>.
+            <dn> type str
+            <attrs> list of str
         """
-        filter = "(distinguishedName=" + dn + ")"
-        logging.debug('ldap.search: {} return Attrs: {}'.format(filter, attrs))
-        try:
-            q = self.lcon.search(self.ADSearchBase, self.ADSearchScope, filter, attrs)
-        except Exception:
-            logging.error('filter error: {}'.format(filter))
-            return None
-        except ldap.LDAPError as err:
-            errstr = ''
-            if "desc" in err[0]:
-                errstr = err[0]["desc"]
-            if "info" in err[0]:
-                errstr += err[0]["info"]
-        namesearch = self.lcon.result(q, 60)[1]
-        logging.debug('attrs: {} result: {}'.format(attrs, namesearch))
-        result = []
-        if namesearch[0][0]:
-            for attr in attrs:
-                if attr in namesearch[0][1]:
-                    try:
-                        query_value = namesearch[0][1][attr][0].decode("utf-8")
-                        logging.debug('decoded: {}'.format(namesearch[0][1][attr][0]))
-                    except UnicodeDecodeError:
-                        query_value = namesearch[0][1][attr][0]
-                    result.append([attr, query_value])
-        if len(result) == 0:
-            return None
-        else:
-            return result
-
-    def convertSid(self, sid_obj):
-        """  convert base64 encoded objectSid to string representation """
-        logging.debug('type: {}'.format(type(sid_obj)))
-        if isinstance(sid_obj, list):
-            sid = sid_obj[0]
-        else:
-            sid = sid_obj
-        version = struct.unpack('B', sid[0:1])[0]
-        # I do not know how to treat version != 1 (it does not exist yet)
-        assert version == 1, version
-        length = struct.unpack('B', sid[1:2])[0]
-        authority = struct.unpack(b'>Q', b'\x00\x00' + sid[2:8])[0]
-        string = 'S-%d-%d' % (version, authority)
-        sid = sid[8:]
-        assert len(sid) == 4 * length
-        for i in range(length):
-            value = struct.unpack('<L', sid[4*i:4*(i+1)])[0]
-            string += '-%d' % value
-        return string
-
-    def sidstr2gid(self, sidstr):
-        """ convert an active directory Sid string to a valid gid number
-            for posix permission management
-        """
-        m = re.search(r"\d+$", sidstr)
-        return int(m.group()) + 1000000
+        ldapfilter = "(distinguishedName=" + dn + ")"
+        sync = self.lcon.search(self.ADSearchBase,
+                                search_filter=ldapfilter,
+                                search_scope=SUBTREE,
+                                attributes=attrs)
+        if not sync:
+            logging.error("result: {}".format(self.lcon.result))
+            raise SystemExit
+        if len(self.lcon.entries) == 0:
+            print('No resesult for: {}'.format(dn))
+            self.unbind()
+            raise SystemExit
 
     def organization(self, user_name):
-        """display the orgainization above <user_name>
-        End contidition is not consistent for all organizations
+        """
+           display the orgainization above <user_name>
+           End contidition is not consistent for all organizations
         """
         DN = self.userGetDN(user_name)
-        results = self.getAttr(DN, ['manager'])
+        self.getAttr(DN, ['manager'])
+        managerDN = self.escapeDN(self.lcon.entries[0].manager)
         Attrs = ['sAMAccountName', 'displayName', 'title', 'manager', 'distinguishedName']
-        managerDN = self.escapeDN(results[0][1])
         while True:
-            results = self.getAttr(managerDN, Attrs,)
-            if results is None:
+            self.getAttr(managerDN, Attrs,)
+            if len(self.lcon.entries) == 0:
                 break
-            dresult = dict(results)
+            dresult = dict(self.lcon.response[0]['attributes'])
             (last, first) = dresult['displayName'].split(',')
             fixed = first.strip() + ' ' + last
             print('{} - {} ({})'.format(fixed, dresult['title'],
@@ -433,35 +380,112 @@ class ldapOps:
                 if dresult['manager'] == dresult['distinguishedName']:
                     break
 
+    def userSearch(self, target):
+        """
+            --search <uid> | displayName
+            Search for Class Person where target is part of the <user> or <displayName>
+            objects.
+            return uid and Displayname
+        """
+        Attrs = ["displayName", "gecos", "uid", "uidNumber", "cn", "mail"]
+        ldapfilter = "(&(objectClass=organizationalPerson)(objectClass=user)"
+        ldapfilter += "(|(uid=*{}*)(displayName=*{}*)))".format(target, target)
+        sync = self.lcon.search(search_base=self.ADSearchBase,
+                                search_filter=ldapfilter,
+                                search_scope=SUBTREE,
+                                attributes=Attrs)
+        if not sync or self.lcon.result['result'] != 0:
+            logging.error('search error: {}'.format(self.lcon.result))
+            return
+        for result in self.lcon.entries:
+            try:
+                uid = str(result.uid)
+            except NameError:
+                uid = ''
+            try:
+                mail = str(result.mail)
+            except NameError:
+                mail = ''
+            if 'uidNumber' in result:
+                uidNumber = str(result.uidNumber)
+            else:
+                uidNumber = ''
+            print("{:16}{:12}{:26}{}".format(uid, uidNumber, result.displayName[0], mail))
+
+    def isMemberOf(self, user, group):
+        """ check if Class person <user> is a member of <group>
+            there are two ways of performing this query.
+            look at memberOf for user OR query Class group for membership
+        """
+        self.memberOf(user)
+        for obj in self.lcon.response:
+            if 'attributes' not in obj:
+                break
+            attrs = obj['attributes']
+            if 'memberOf' in attrs:
+                logging.debug("{} is a memberOf: {}".format(user, attrs['memberOf']))
+                for member in attrs['memberOf']:
+                    cn = member.split(",")[0][3:]
+                    if cn == group:
+                        return True
+                        print('=== Found ===')
+        return False
+
+    def memberGet(self, target):
+        """
+           --memberOf <uid>
+           list memberOf objects for Class person by sAMAccountName
+        """
+        self.memberOf(target)
+        for obj in self.lcon.response:
+            if 'attributes' not in obj:
+                continue
+            attrs = obj['attributes']
+            if 'memberOf' in attrs:
+                logging.debug('{} is a memberOf: {}'.format(target, attrs['memberOf']))
+                for member in attrs['memberOf']:
+                    print(member.split(",")[0][3:])
+
+    def memberOf(self, user):
+        """ list group membership for a user where group
+        is in the OU Security Group
+        """
+        Attrs = ["displayName", "memberOf"]
+        ldapfilter = "(&(objectClass=person)(sAMAccountName={}))".format(user)
+        sync = self.lcon.search(search_base=self.ADSearchBase,
+                                search_filter=ldapfilter,
+                                search_scope=SUBTREE,
+                                attributes=Attrs)
+        if not sync:
+            logging.error('search error: {}'.format(self.lcon.result))
+            raise SystemExit
+
 
 def parse_arguments():
     """ Parse command-line arguments. """
 
     help = (
         "Manage Active Directory Security Groups from Linux CLI "
-        "and use Kerberos tickets to authorize group managers"
+        "and use Kerberos tickets to authorized group managers."
     )
-    parser = argparse.ArgumentParser(prog="ADgroup", description=help)
+    parser = ArgumentParser(prog="ADgroup", description=help)
     parser.add_argument(
         '--version', '-V', action='version', version="%(prog)s " + __version__ + ' - ' + __date__
     )
     parser.add_argument(
-        "--debug", "-d", dest="debug", action="store_true", default=False,
+        "--debug", "-d", dest="debug", action="store_false", default=False,
         help="Enable debug messages",
     )
     parser.add_argument(
         "--full", dest="full", action="store_true", default=False,
-        help='Show all AD records when used with "user" and "list" commands.',
-    )
-    parser.add_argument(
-        "groupname", type=str, default="",
-        help=("AccountName of the AD security group to be created or changed. "),
+        help='Show additional information when used with "user", "group" and "list" commands.',
     )
     create_help = "Create security group and set the gidNumber based on objectSid"
     parser.add_argument(
         "--create", "-c", dest="create", action="store_true", default=False,
         help=create_help,
     )
+    parser.add_argument("--delete", dest="delete", action="store_true", default="", help=SUPPRESS)
     parser.add_argument(
         "--list", "-l", dest="list", action="store_true", default=False,
         help="list the members of the security group in the positional argument",
@@ -488,18 +512,20 @@ def parse_arguments():
         "--group", "-g", dest="group", action="store_true", default=False,
         help=("List AD record for group."),
     )
+    parser.add_argument(
+        "--search", "-s", dest="search", action="store_true", default=False,
+        help=("Search uid and displayName fields."),
+    )
+    parser.add_argument(
+        "--memberOf", dest="memberOf", action="store_true", default=False,
+        help=("List storage groups for user"),
+    )
+    parser.add_argument(
+        "groupname", nargs='?', type=str,
+        help=("AccountName of the AD security group to be created or changed. "),
+    )
     args = parser.parse_args()
-    if (not args.create and
-            not args.members2add and
-            not args.members2remove and
-            not args.list and
-            not args.user and
-            not args.group and
-            not args.org):
-        parser.print_help()
-        sys.exit(1)
-    else:
-        return args
+    return args
 
 
 def main():
@@ -509,15 +535,12 @@ def main():
     except SystemExit:
         return 1
 
-    repmsg = (
-        "Make sure you add at least one member to the new group.\n"
-        "After that you may have to wait up to 15 min until users can access "
-    )
     if args.create:
         if not args.groupname.endswith("_grp"):
             args.groupname = args.groupname + "_grp"
         ad.groupCreate(args.groupname)
-        print(repmsg)
+    elif args.delete:
+        ad.groupDelete(args.groupname)
     elif args.members2add:
         args.members2add = args.members2add.replace(" ", ",")
         ad.groupChangeMembers(args.groupname, args.members2add.split(","), changemode="add")
@@ -525,15 +548,20 @@ def main():
         args.members2remove = args.members2remove.replace(" ", ",")
         ad.groupChangeMembers(args.groupname, args.members2remove.split(","), changemode="remov")
     elif args.user:
-        ad.user_info(args.groupname, args.full)
+        ad.userGetEntry(args.groupname, args.full)
     elif args.group:
-        ad.group_info(args.groupname, args.full)
+        ad.groupGetEntry(args.groupname, args.full)
     elif args.org:
         ad.organization(args.groupname)
     elif args.list:
-        members = ad.groupGetMembers(args.groupname)
-        for m in members:
-            print(m)
+        ad.groupGetMembers(args.groupname, args.full)
+    elif args.search:
+        ad.userSearch(args.groupname)
+    elif args.memberOf:
+        ad.memberGet(args.groupname)
+    else:
+        print('No arguement given. Try --help')
+    ad.unbind()
 
 
 if __name__ == "__main__":
