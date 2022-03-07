@@ -2,6 +2,12 @@
 
 Please update this file when making changes to ADgroup.py
 
+## [1.1.0] Feb 15, 2022
+  * rewrite to use LDAP3 
+  * --memberOf [uid|user name] used to show all objects associated with a user
+  * --search [uid| user name] Search the <displayName> and <uid> fields 
+  * --org [uid } username ] Show organization for user
+
 ## [1.0.2] Oct 20, 2021
   * bug gidNumber not set during create group.  Issues with decoding objectSid
 
